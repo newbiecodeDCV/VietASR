@@ -92,7 +92,7 @@ def compute_fbank(
     output_dir: Path = Path("../data6/fbank"),
 ):
     # Reduce to avoid OOM during feature extraction
-    num_jobs = min(4, os.cpu_count())
+    num_jobs = min(8, os.cpu_count())
     num_mel_bins = 80
 
     if bpe_model:
@@ -193,6 +193,20 @@ def compute_fbank(
             if "train" in partition:
                 if bpe_model:
                     cut_set = filter_cuts(cut_set, sp)
+            
+            # Apply text normalization (normalize Vietnamese tone placement)
+            logging.info(f"Applying text normalization for {partition}")
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent / "utils"))
+            from normalize_hybrid import normalize_hybrid_tone
+            
+            def normalize_text(cut):
+                for sup in cut.supervisions:
+                    if sup.text:
+                        sup.text = normalize_hybrid_tone(sup.text.lower())
+                return cut
+            
+            cut_set = cut_set.map(normalize_text)
             
             # Apply speed perturbation if requested (for any partition)
             if perturb_speed:

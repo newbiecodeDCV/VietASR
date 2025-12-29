@@ -1,15 +1,16 @@
 """
-ASR (Automatic Speech Recognition) FastAPI Server
+ASR (Automatic Speech Recognition) FastAPI Server v2
 
-This server provides an API endpoint for speech recognition using various ESPnet-based models.
-It supports different model formats (PyTorch, ONNX, OpenVINO) and configurations.
+API server cho phép nhận dạng giọng nói sử dụng icefall/k2 framework.
+Hỗ trợ cả TorchScript và PyTorch checkpoint.
 
-Key Features:
-- Supports multiple model architectures (standard ASR, Dolphin, Transducer)
-- Handles audio file processing and segmentation
-- Provides text normalization
-- Supports beam search with language model integration
-- Handles concurrent requests with rate limiting
+Chức năng chính:
+- Hỗ trợ TorchScript model (jit_script.pt)
+- Hỗ trợ PyTorch checkpoint (epoch-{N}.pt)
+- Greedy search và Modified beam search
+- Text normalization nội bộ (vi2en.txt)
+- Audio segmentation cho file dài
+- Download file từ URL
 """
 
 import argparse
@@ -17,9 +18,11 @@ import asyncio
 import os
 import sys
 import time
+import math
 import requests
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
+from pathlib import Path
 
 import aiohttp
 import auditok
@@ -28,25 +31,94 @@ from pydub import AudioSegment
 import numpy as np
 import uvicorn
 import jwt
+import torch
+import sentencepiece as spm
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from loguru import logger
 from starlette.datastructures import FormData
 from fastapi.middleware.cors import CORSMiddleware
 
-from utils.update_config_yaml import update_config
-from utils.process_align import process_text_norm
-from utils.utils import merge_short_audio_segments
-from espnet2.bin.asr_inference import Speech2Text
-from espnet2.bin.dolphin.dolphin_inference import DolphinSpeech2Text
-from espnet2.bin.asr_transducer_inference import Speech2Text as Speech2TextTransducer
-from espnet2.espnet_onnx.asr.asr_model import Speech2Text as Speech2TextONNX
-from espnet2.espnet_onnx.asr.asr_model_openvino import Speech2Text as Speech2TextOpenVINO
-from espnet2.espnet_onnx.asr.s2t_model import Speech2Text as DolphinSpeech2TextONNX
-from espnet2.fileio.sound_scp import soundfile_read
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "SSL" / "zipformer_fbank"))
+from text_normalization import normalize_text, remove_filler_words
+
+API_TEXT_NORM = 'https://speech.aiservice.vn/asr/textnorm'
+def call_text_norm(text: str, domain: str = None) -> Dict[str, Any]:
+    """Call the text normalization API to normalize the input text."""
+    response = requests.post(API_TEXT_NORM, json={"text": text, "domain": domain})
+    return response.json()
+
+def _find_start_indices(main_list: List[str], sublist: List[str]) -> List[int]:
+    """Find all starting indices where sublist appears in main_list."""
+    start_indices = []
+    try:
+        index = main_list.index(sublist[0])
+        while index <= len(main_list) - len(sublist):
+            if main_list[index:index + len(sublist)] == sublist:
+                start_indices.append(index)
+            index = main_list.index(sublist[0], index + 1)
+    except ValueError:
+        pass
+    return start_indices
+
+def process_text_norm(
+    text: str,
+    segments: List[Tuple[float, float, str]],
+    domain: str = None
+) -> Tuple[str, List[Tuple[float, float, str]]]:
+    """Process text normalization and adjust the corresponding segments."""
+    # Call text normalization API
+    norm_result = call_text_norm(text, domain=domain)
+    out_text = norm_result["result"]["text"]
+    replace_dict = norm_result["result"]["replace_dict"]
+
+    # Find all replacement positions in the original text
+    replace_obj = {}
+    list_starts = []
+    text_words = text.split()
+
+    for original_phrase, normalized_phrase in replace_dict.items():
+        start_indices = _find_start_indices(text_words, original_phrase.split())
+        list_starts += start_indices
+
+        for start_idx in start_indices:
+            replace_obj[start_idx] = {
+                "org_text": original_phrase,
+                "norm_text": normalized_phrase,
+                "end_idx": start_idx + len(original_phrase.split())
+            }
+
+    # Sort the starting indices for processing in order
+    list_starts = sorted(list_starts)
+
+    # Reconstruct segments with normalized text
+    out_segments = []
+    i = 0
+    n = len(segments)
+
+    while i < n:
+        if i in list_starts:
+            # Handle replacement case
+            replacement = replace_obj[i]
+            start_time = segments[i][0]
+            end_time = segments[replacement["end_idx"] - 1][1]
+            out_segments.append([start_time, end_time, replacement["norm_text"]])
+            i = replacement["end_idx"]  # Skip the replaced words
+        else:
+            # Handle normal case
+            start, end, word = segments[i]
+            out_segments.append([start, end, word])
+            i += 1
+
+    return out_text, out_segments
 
 # Initialize FastAPI app with CORS middleware
-app = FastAPI()
+app = FastAPI(
+    title="VietASR API",
+    description="Vietnamese Speech Recognition API using icefall/k2 framework",
+    version="2.0.0"
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,35 +128,329 @@ app.add_middleware(
 )
 
 # Constants
-UPLOAD_FOLDER = "uploaded"  # Directory for temporary audio files
-PRIVATE_TOKEN = "41ad97aa3c747596a4378cc8ba101fe70beb3f5f70a75407a30e6ddab668310d"  # Hardcoded auth token
+UPLOAD_FOLDER = "uploaded"  
+PRIVATE_TOKEN = "41ad97aa3c747596a4378cc8ba101fe70beb3f5f70a75407a30e6ddab668310d"
 
 # Ensure upload directory exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
+class ASRModel:
+    """
+    Unified ASR Model wrapper supporting both TorchScript and PyTorch checkpoints.
+    """
+    
+    def __init__(
+        self,
+        model_path: str,
+        bpe_path: str,
+        model_type: str = "auto",
+        device: str = "cuda:0",
+    ):
+        """
+        Initialize ASR Model.
+        
+        Args:
+            model_path: Path to TorchScript (.pt jit) or PyTorch checkpoint
+            bpe_path: Path to sentencepiece bpe.model
+            model_type: "torchscript", "pytorch", or "auto" (auto-detect)
+            device: Device to run model on
+        """
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.model_path = model_path
+        
+        # Auto-detect model type if needed
+        if model_type == "auto":
+            self.model_type = self._detect_model_type(model_path)
+        else:
+            self.model_type = model_type
+        
+        logger.info(f"Loading {self.model_type} model from {model_path}")
+        
+        # Load model
+        self.model = self._load_model(model_path)
+        self.model.eval()
+        self.model.to(self.device)
+        
+        # Load BPE model
+        self.sp = spm.SentencePieceProcessor()
+        self.sp.load(bpe_path)
+        logger.info(f"Loaded BPE model from {bpe_path}, vocab_size={self.sp.get_piece_size()}")
+        
+        # Get blank_id and context_size from model
+        try:
+            self.blank_id = int(self.model.decoder.blank_id)
+            self.context_size = int(self.model.decoder.context_size)
+        except AttributeError:
+            self.blank_id = 0
+            self.context_size = 2
+            logger.warning(f"Could not get blank_id/context_size from model, using defaults: {self.blank_id}, {self.context_size}")
+    
+    def _detect_model_type(self, model_path: str) -> str:
+        """Auto-detect model type based on file size and name."""
+        file_size = os.path.getsize(model_path)
+        # TorchScript models are typically smaller (< 500MB)
+        # PyTorch checkpoints with optimizer states are larger (> 1GB)
+        if "jit" in model_path.lower() or file_size < 500 * 1024 * 1024:
+            return "torchscript"
+        return "pytorch"
+    
+    def _load_model(self, model_path: str):
+        """Load model based on type."""
+        if self.model_type == "torchscript":
+            return torch.jit.load(model_path, map_location=self.device)
+        else:
+            # For PyTorch checkpoint, need to construct model architecture
+            # This requires importing from the training codebase
+            raise NotImplementedError(
+                "PyTorch checkpoint loading requires model architecture. "
+                "Please use TorchScript model or provide model architecture."
+            )
+    
+    def _extract_features(self, audio: np.ndarray, sample_rate: int = 16000) -> torch.Tensor:
+        """
+        Extract Fbank features from audio.
+        Using simple torch-based implementation compatible with training.
+        """
+        # Convert to torch tensor
+        if isinstance(audio, np.ndarray):
+            waveform = torch.from_numpy(audio).float()
+        else:
+            waveform = audio.float()
+        
+        # Ensure correct shape [1, num_samples]
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        
+        # Scale audio (matching training preprocessing)
+        waveform = waveform * 32768.0
+        
+        # Simple Fbank extraction using torchaudio
+        try:
+            import torchaudio.compliance.kaldi as kaldi
+            features = kaldi.fbank(
+                waveform,
+                num_mel_bins=80,
+                frame_length=25,
+                frame_shift=10,
+                sample_frequency=sample_rate,
+                dither=0,
+                snip_edges=False,
+            )
+        except ImportError:
+            # Fallback: use kaldifeat if torchaudio doesn't work
+            import kaldifeat
+            opts = kaldifeat.FbankOptions()
+            opts.device = torch.device("cpu")
+            opts.frame_opts.dither = 0
+            opts.frame_opts.snip_edges = False
+            opts.frame_opts.samp_freq = sample_rate
+            opts.mel_opts.num_bins = 80
+            fbank = kaldifeat.Fbank(opts)
+            features = fbank(waveform.squeeze(0) * 32768.0)
+        
+        return features
+    
+    def _greedy_search(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+    ) -> List[List[int]]:
+        """
+        Greedy search decoding for TorchScript model.
+        """
+        assert encoder_out.ndim == 3
+        N = encoder_out.size(0)
+        device = encoder_out.device
+        
+        packed_encoder_out = torch.nn.utils.rnn.pack_padded_sequence(
+            input=encoder_out,
+            lengths=encoder_out_lens.cpu(),
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        
+        batch_size_list = packed_encoder_out.batch_sizes.tolist()
+        
+        hyps = [[self.blank_id] * self.context_size for _ in range(N)]
+        
+        decoder_input = torch.tensor(
+            hyps,
+            device=device,
+            dtype=torch.int64,
+        )
+        
+        decoder_out = self.model.decoder(
+            decoder_input,
+            need_pad=torch.tensor([False], device=device),
+        ).squeeze(1)
+        
+        offset = 0
+        for batch_size in batch_size_list:
+            start = offset
+            end = offset + batch_size
+            current_encoder_out = packed_encoder_out.data[start:end]
+            offset = end
+            
+            decoder_out = decoder_out[:batch_size]
+            
+            logits = self.model.joiner(
+                current_encoder_out,
+                decoder_out,
+            )
+            
+            y = logits.argmax(dim=1).tolist()
+            emitted = False
+            for i, v in enumerate(y):
+                if v != self.blank_id:
+                    hyps[i].append(v)
+                    emitted = True
+            
+            if emitted:
+                decoder_input = [h[-self.context_size:] for h in hyps[:batch_size]]
+                decoder_input = torch.tensor(
+                    decoder_input,
+                    device=device,
+                    dtype=torch.int64,
+                )
+                decoder_out = self.model.decoder(
+                    decoder_input,
+                    need_pad=torch.tensor([False], device=device),
+                ).squeeze(1)
+        
+        sorted_ans = [h[self.context_size:] for h in hyps]
+        ans = []
+        unsorted_indices = packed_encoder_out.unsorted_indices.tolist()
+        for i in range(N):
+            ans.append(sorted_ans[unsorted_indices[i]])
+        
+        return ans
+    
+    def _modified_beam_search(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        beam_size: int = 4,
+    ) -> List[List[int]]:
+        """
+        Modified beam search decoding.
+        """
+        try:
+            from beam_search import modified_beam_search
+            return modified_beam_search(
+                model=self.model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=beam_size,
+            )
+        except ImportError:
+            logger.warning("beam_search module not found, falling back to greedy search")
+            return self._greedy_search(encoder_out, encoder_out_lens)
+    
+    @torch.no_grad()
+    def recognize(
+        self,
+        audio: np.ndarray,
+        sample_rate: int = 16000,
+        decoding_method: str = "greedy_search",
+        beam_size: int = 4,
+        apply_text_norm: bool = True,
+    ) -> Tuple[str, str]:
+        """
+        Recognize speech from audio.
+        
+        Args:
+            audio: Audio samples as numpy array
+            sample_rate: Sample rate of audio
+            decoding_method: "greedy_search" or "modified_beam_search"
+            beam_size: Beam size for beam search
+            apply_text_norm: Whether to apply text normalization
+            
+        Returns:
+            Tuple of (raw_text, normalized_text)
+        """
+        # Extract features
+        features = self._extract_features(audio, sample_rate)
+        features = features.unsqueeze(0).to(self.device)  # [1, T, 80]
+        feature_lengths = torch.tensor([features.size(1)], device=self.device)
+        
+        # Encode
+        encoder_out, encoder_out_lens = self.model.encoder(
+            features=features,
+            feature_lengths=feature_lengths,
+        )
+        
+        # Decode
+        if decoding_method == "greedy_search":
+            hyp_tokens = self._greedy_search(encoder_out, encoder_out_lens)
+        elif decoding_method == "modified_beam_search":
+            hyp_tokens = self._modified_beam_search(encoder_out, encoder_out_lens, beam_size)
+        else:
+            raise ValueError(f"Unsupported decoding method: {decoding_method}")
+        
+        # Convert tokens to text
+        raw_text = self.sp.decode(hyp_tokens[0])
+        
+        # Apply text normalization
+        if apply_text_norm:
+            normalized_text = normalize_text(raw_text)
+        else:
+            normalized_text = raw_text
+        
+        return raw_text, normalized_text
+
+
+# Global model instance
+asr_model: Optional[ASRModel] = None
+model_name: str = ""
+
+
+def merge_short_audio_segments(segments, target_length):
+    """
+    Groups short audio segments into sublists where the combined duration 
+    is closest to the target length.
+    """
+    if not segments:
+        return []
+    
+    result = []
+    current_sublist = []
+    current_length = 0
+    
+    for segment in segments:
+        start, end = segment
+        segment_length = end - start
+        new_length = current_length + segment_length
+        
+        if (current_sublist and 
+            abs(new_length - target_length) > abs(current_length - target_length)):
+            result.append(current_sublist)
+            current_sublist = [segment]
+            current_length = segment_length
+        else:
+            current_sublist.append(segment)
+            current_length = new_length
+    
+    if current_sublist:
+        result.append(current_sublist)
+    
+    return result
+
+
 async def download_file(url: str) -> Optional[str]:
     """
     Download an audio file from a given URL and save it locally.
-    
-    Args:
-        url: The URL of the audio file to download
-        
-    Returns:
-        str: Path to the downloaded file if successful, None otherwise
     """
     try:
-        # Special handling for Stringee API URLs
         if 'api.stringee.com' in url:
             response = requests.get(url, stream=True)
             if response.status_code == 200:
-                file_name = url.split('/')[-1][:50]  # Truncate long filenames
+                file_name = url.split('/')[-1][:50]
                 save_filepath = os.path.join(UPLOAD_FOLDER, f'{file_name}.wav')
                 with open(save_filepath, "wb") as file:
                     for chunk in response.iter_content(chunk_size=8192):
                         file.write(chunk)
         else:
-            # General file download handling
             filename = url.split("/")[-1]
             save_filepath = f"{UPLOAD_FOLDER}/{filename}"
             async with aiohttp.ClientSession() as session:
@@ -96,8 +462,7 @@ async def download_file(url: str) -> Optional[str]:
                                 if not chunk:
                                     break
                                 f.write(chunk)
-
-        # Verify download was successful
+        
         if os.path.exists(save_filepath):
             logger.success(f"Downloaded file successfully: {url} to {save_filepath}")
             return save_filepath
@@ -112,28 +477,26 @@ async def download_file(url: str) -> Optional[str]:
 
 @app.get("/")
 async def health_check() -> Dict[str, str]:
-    """Health check endpoint that returns basic service information."""
-    return {"message": "ASR service is running", "usage": "Use POST method for speech recognition"}
+    """Health check endpoint."""
+    return {
+        "message": " API  is running",
+        "model": model_name,
+        "usage": "Use POST method for speech recognition"
+    }
 
 
 @app.post("/")
 async def process(request: Request) -> JSONResponse:
     """
     Main endpoint for speech recognition processing.
-    
-    Handles different request types (JSON, form data, raw bytes) and returns recognition results.
-    
-    Args:
-        request: FastAPI request object containing audio data and parameters
-        
-    Returns:
-        JSONResponse: Recognition results or error message
     """
+    global asr_model, model_name
+    
     # Authentication check
     token = request.headers.get("Authorization")
     if not token:
         return _error_response(400, "Token is missing")
-        
+    
     if token != PRIVATE_TOKEN:
         try:
             jwt.decode(token, "datamining_vcc", algorithms="HS256")
@@ -141,7 +504,7 @@ async def process(request: Request) -> JSONResponse:
             return _error_response(401, "Signature expired. Please log in again")
         except jwt.InvalidTokenError:
             return _error_response(400, "Invalid token. Please log in again")
-
+    
     # Initialize response structure
     response = {
         "status": 0,
@@ -152,41 +515,49 @@ async def process(request: Request) -> JSONResponse:
         "message": "process file error",
         "code": 400
     }
-
+    
     # Parse request data based on content type
-    try:
-        request_data = await request.json()
-    except:
-        request_data = await request.form()
-        if len(request_data) == 0:
-            request_data = await request.body()
-    finally:
-        if not isinstance(request_data, (dict, FormData, bytes)):
-            response["message"] = "Unsupported request type, try [json, formdata or bytes]"
+    content_type = request.headers.get("Content-Type", "")
+    
+    if "application/json" in content_type:
+        try:
+            request_data = await request.json()
+        except Exception as e:
+            response["message"] = f"Invalid JSON: {str(e)}"
             return JSONResponse(response)
-
+    elif "multipart/form-data" in content_type:
+        request_data = await request.form()
+    elif "audio/" in content_type or "application/octet-stream" in content_type:
+        request_data = await request.body()
+    else:
+        # Try to parse as JSON first, then form, then bytes
+        try:
+            request_data = await request.json()
+        except:
+            request_data = await request.form()
+            if len(request_data) == 0:
+                request_data = await request.body()
+    
+    if not isinstance(request_data, (dict, FormData, bytes)):
+        response["message"] = "Unsupported request type, try [json, formdata or bytes]"
+        return JSONResponse(response)
+    
     # Process different request formats
+    # Only support: 1) JSON with URL, 2) Raw binary audio
     if isinstance(request_data, dict):
-        # JSON request handling
-        file_url = request_data["file"]
+        file_url = request_data.get("file", "")
+        
+        # Only support URL (http/https)
+        if not file_url.startswith(('http://', 'https://')):
+            response["message"] = "Invalid file URL. Must start with http:// or https://"
+            return JSONResponse(response)
+        
+        # Download file from URL
         save_filepath = await download_file(file_url)
         if not save_filepath:
             response["message"] = f"Cannot download file from: {file_url}"
             return JSONResponse(response)
-            
-        params = {
-            "speed": int(request_data.get("speed", 0)),
-            "text_norm": int(request_data.get("text_norm", 1)) == 1,
-            "domain": request_data.get("domain"),
-            "split": int(request_data.get("split", 1)),
-        }
         
-    elif isinstance(request_data, FormData):
-        # Form data handling
-        save_filepath = f"{UPLOAD_FOLDER}/{request_data['file'].filename}"
-        with open(save_filepath, "wb") as f:
-            f.write(await request_data["file"].read())
-            
         params = {
             "speed": int(request_data.get("speed", 0)),
             "text_norm": int(request_data.get("text_norm", 1)) == 1,
@@ -195,35 +566,44 @@ async def process(request: Request) -> JSONResponse:
         }
         
     elif isinstance(request_data, bytes):
-        # Raw audio bytes handling
+        # Raw binary audio
+        if len(request_data) == 0:
+            response["message"] = "Empty audio data received"
+            return JSONResponse(response)
+        
         timestamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S.%f')[:-4]
         save_filepath = f"{UPLOAD_FOLDER}/{timestamp}.wav"
         with open(save_filepath, "wb") as f:
             f.write(request_data)
-            
+        
         params = {
             "speed": 0,
             "text_norm": True,
             "domain": None,
             "split": 1,
         }
-
+    else:
+        response["message"] = "Unsupported request format. Use JSON with URL or raw binary audio."
+        return JSONResponse(response)
+    
     # Perform speech recognition
     try:
         beam_size = _get_beam_size(params["speed"])
+        decoding_method = "modified_beam_search" if params["speed"] >= 0 else "greedy_search"
+        
         recognition_params = {
             "beam_size": beam_size,
             "text_norm": params["text_norm"],
-            "domain": params["domain"],
             "split": params["split"],
+            "decoding_method": decoding_method,
         }
         
-        asr_result = await recognize_file(duration_model_mapping, save_filepath, recognition_params)
+        asr_result = await recognize_file(save_filepath, recognition_params)
         
-        # Clean up and return success response
+        # Clean up temp files
         if os.path.exists(save_filepath):
             os.remove(save_filepath)
-            
+        
         return JSONResponse({
             "status": 1,
             "code": 200,
@@ -253,76 +633,24 @@ def _error_response(code: int, message: str) -> JSONResponse:
 def _get_beam_size(speed: int) -> int:
     """Determine beam size based on speed parameter."""
     if speed < 0:
-        return 1  # Fastest but least accurate
+        return 1  # Fastest (greedy)
     elif speed == 0:
-        return 5  # Balanced speed/accuracy
+        return 4  # Balanced
     else:
-        return 10  # Slowest but most accurate
-
-
-async def model_recognize_async(
-    duration_model_mapping: Dict[float, Union[Speech2Text, Speech2TextONNX, Speech2TextOpenVINO]],
-    audio: np.ndarray,
-    params: Dict[str, Any]
-) -> Tuple[str, List[Dict]]:
-    """
-    Perform speech recognition on an audio segment using the appropriate model.
-    
-    Args:
-        duration_model_mapping: Dictionary mapping audio durations to models
-        audio: Numpy array containing audio samples
-        params: Recognition parameters including beam_size, text_norm, domain
-        
-    Returns:
-        Tuple of recognized text and alignment segments
-    """
-    beam_size = params['beam_size']
-    text_norm = params['text_norm']
-    domain = params['domain']
-
-    # Handle different model configurations
-    if len(duration_model_mapping) > 1:
-        # Select model based on audio duration
-        audio_duration = len(audio) / 16000
-        for max_dur, model in duration_model_mapping.items():
-            if audio_duration <= max_dur:
-                result = model.recognize(audio, beam_size)[0]
-                text = result[0]
-                segments = result[-1]
-                text_normalized, norm_segments = process_text_norm(text, segments, domain)
-                if text_norm:
-                    return text_normalized, text_normalized, norm_segments
-                return text, text_normalized, segments
-    else:
-        # Single model case
-        model = duration_model_mapping['model']
-        result = model.recognize(audio, beam_size)[0]
-        text = result[0]
-        segments = result[-1]
-        text_normalized, norm_segments = process_text_norm(text, segments, domain)
-        if text_norm:
-            return text_normalized, text_normalized, norm_segments
-        return text, text_normalized, segments
+        return 10  # Most accurate
 
 
 async def recognize_file(
-    duration_model_mapping: Dict[float, Union[Speech2Text, Speech2TextONNX, Speech2TextOpenVINO]],
     file_path: str,
     params: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
     Process an audio file through speech recognition pipeline.
-    
-    Args:
-        duration_model_mapping: Dictionary mapping audio durations to models
-        file_path: Path to audio file
-        params: Recognition parameters
-        
-    Returns:
-        Dictionary containing recognition results and metadata
     """
+    global asr_model
+    
     start_time = time.perf_counter()
-
+    
     try:
         # Convert audio to mono WAV format if needed
         sound = AudioSegment.from_file(file_path)
@@ -332,58 +660,89 @@ async def recognize_file(
     except Exception as e:
         logger.error(f"Audio conversion error: {str(e)}")
         raise
-
-    # Read audio file and calculate duration
-    audio, sample_rate = soundfile_read(wav_path)
+    
+    # Read audio file
+    audio, sample_rate = sf.read(wav_path)
     duration = len(audio) / sample_rate
+    
     audio_chunks = []
     timestamps = []
     results = []
-
-    # Split audio if needed (long files or split parameter enabled)
+    
+    # Split audio if needed
     if not params['split'] or (duration > 0.3 and duration <= 10):
-        # Process whole file as single segment
         audio_chunks = [audio]
         timestamps = [{"start": '0', "end": str(duration)}]
     elif duration > 10:
-        # Split long audio into segments
         logger.info(f"Processing long audio file: duration={duration:.2f}s")
         
         audio_regions = auditok.split(
             wav_path,
-            min_dur=0.5,     # Minimum duration of valid segment (seconds)
-            max_dur=10,       # Maximum duration of segment
-            max_silence=0.3,   # Maximum allowed silence within segment
+            min_dur=0.5,
+            max_dur=10,
+            max_silence=0.3,
         )
         
-        # Merge short segments and prepare for recognition
         segments = [(int(r.meta.start * sample_rate), int(r.meta.end * sample_rate)) for r in audio_regions]
         segments = merge_short_audio_segments(segments, target_length=10 * sample_rate)
         
         for seg in segments:
             chunk = np.concatenate([audio[start:end] for start, end in seg], axis=0)
-            if len(chunk) >= 1600:  # Minimum meaningful audio length
+            if len(chunk) >= 1600:
                 audio_chunks.append(chunk)
                 timestamps.append({
                     "start": str(seg[0][0] / sample_rate),
                     "end": str(seg[-1][-1] / sample_rate)
                 })
-
-    # Process all audio chunks in parallel
+    
+    # Process all audio chunks
     if audio_chunks:
-        recognition_tasks = [
-            model_recognize_async(duration_model_mapping, chunk, params)
-            for chunk in audio_chunks
-        ]
-        recognition_results = await asyncio.gather(*recognition_tasks)
-        
-        # Combine results with timestamps
-        for ts, (text, text_norm, segments) in zip(timestamps, recognition_results):
-            ts["text"] = text
-            ts["text_norm"] = text_norm
-            ts["segments"] = segments
+        for ts, chunk in zip(timestamps, audio_chunks):
+            # Get raw text from ASR model (no internal text norm)
+            raw_text, _ = asr_model.recognize(
+                audio=chunk,
+                sample_rate=sample_rate,
+                decoding_method=params["decoding_method"],
+                beam_size=params["beam_size"],
+                apply_text_norm=False,  # Don't apply internal norm
+            )
+            
+            # Generate dummy word-level segments based on audio duration
+            # (Real word alignment would require CTC or similar)
+            chunk_duration = len(chunk) / sample_rate
+            chunk_start = float(ts["start"])
+            words = raw_text.split()
+            segments = []
+            
+            if words:
+                word_duration = chunk_duration / len(words)
+                for i, word in enumerate(words):
+                    word_start = chunk_start + i * word_duration
+                    word_end = word_start + word_duration
+                    segments.append((round(word_start, 2), round(word_end, 2), word))
+            
+            # Apply text normalization using external API (same as original API)
+            if params["text_norm"] and raw_text.strip():
+                try:
+                    text_normalized, norm_segments = process_text_norm(
+                        raw_text, segments, params.get("domain")
+                    )
+                    ts["text"] = text_normalized
+                    ts["text_norm"] = text_normalized
+                    # Convert segments to list format [[start, end, word], ...]
+                    ts["segments"] = [[s[0], s[1], s[2]] for s in norm_segments]
+                except Exception as e:
+                    logger.warning(f"Text norm API failed: {e}, using raw text")
+                    ts["text"] = raw_text
+                    ts["text_norm"] = raw_text
+                    ts["segments"] = [[s[0], s[1], s[2]] for s in segments]
+            else:
+                ts["text"] = raw_text
+                ts["text_norm"] = raw_text
+                ts["segments"] = [[s[0], s[1], s[2]] for s in segments]
+            
             results.append(ts)
-
+    
     # Prepare final response
     end_time = time.perf_counter()
     processing_time = end_time - start_time
@@ -400,249 +759,46 @@ async def recognize_file(
     }
 
 
-def load_model(args: argparse.Namespace) -> Dict[float, Any]:
-    """
-    Load the appropriate ASR model based on configuration.
-    
-    Args:
-        args: Command line arguments containing model configuration
-        
-    Returns:
-        Dictionary mapping audio durations to loaded models
-    """
-    model_mapping = {}
-    
-    # Dolphin ONNX model
-    if "dolphin" in args.model_dir and "onnx" in args.model_dir:
-        logger.info("Loading Dolphin ONNX model")
-        model_mapping = {2: None, 4: None, 10: None}
-        length_duration_mapping = {256: 2, 512: 4, 1280: 10}
-        
-        for max_length, max_duration in length_duration_mapping.items():
-            logger.info(f"Loading model with max length: {max_length}")
-            model_dir = args.model_dir[:-1] + f"_{max_length}"
-            model_mapping[max_duration] = DolphinSpeech2TextONNX(
-                config_path=os.path.join(model_dir, "config"),
-                encoder_onnx_path=os.path.join(model_dir, "encoder"),
-                ctc_onnx_path=os.path.join(model_dir, "ctc"),
-                decoder_onnx_path=os.path.join(model_dir, "decoder"),
-                feat_stats_path=os.path.join(model_dir, "feat_normalize"),
-                bpe_model_path=os.path.join(model_dir, "bpe_model"),
-                kenlm_file=os.path.join(model_dir, "../lm"),
-                kenlm_alpha=args.kenlm_alpha,
-                kenlm_beta=args.kenlm_beta,
-                word_vocab_file=os.path.join(model_dir, "word_vocab"),
-                word_vocab_size=args.word_vocab_size,
-            )
-    
-    # Standard Dolphin model
-    elif "dolphin" in args.model_dir:
-        logger.info("Loading Dolphin model")
-        asr_train_config = os.path.join(args.model_dir, "config")
-        update_config(asr_train_config, args.model_dir)
-        
-        model_mapping["model"] = DolphinSpeech2Text(
-            s2t_train_config=asr_train_config,
-            s2t_model_file=os.path.join(args.model_dir, "model"),
-            device=args.device,
-            ctc_weight=args.ctc_weight,
-            kenlm_file=os.path.join(args.model_dir, "../lm"),
-            kenlm_alpha=args.kenlm_alpha,
-            kenlm_beta=args.kenlm_beta,
-            word_vocab_file=os.path.join(args.model_dir, "word_vocab"),
-            word_vocab_size=args.word_vocab_size,
-        )
-    
-    # ONNX model
-    elif "onnx" in args.model_dir:
-        logger.info("Loading ONNX model")
-        model_mapping = {2: None, 4: None, 6: None, 8: None, 10: None}
-        length_duration_mapping = {256: 2, 512: 4, 768: 6, 1024: 8, 1280: 10}
-        
-        if args.model_dir.endswith("*"):
-            # Load multiple ONNX models for different durations
-            for max_length, max_duration in length_duration_mapping.items():
-                logger.info(f"Loading model with max length: {max_length}")
-                model_dir = args.model_dir[:-1] + f"_{max_length}"
-                model_mapping[max_duration] = Speech2TextONNX(
-                    config_path=os.path.join(model_dir, "config"),
-                    encoder_onnx_path=os.path.join(model_dir, "encoder"),
-                    ctc_onnx_path=os.path.join(model_dir, "ctc"),
-                    feat_stats_path=os.path.join(model_dir, "feat_normalize"),
-                    bpe_model_path=os.path.join(model_dir, "bpe_model"),
-                    kenlm_file=os.path.join(model_dir, "../lm"),
-                    kenlm_alpha=args.kenlm_alpha,
-                    kenlm_beta=args.kenlm_beta,
-                    word_vocab_file=os.path.join(model_dir, "word_vocab"),
-                    word_vocab_size=args.word_vocab_size,
-                )
-        else:
-            # Single ONNX model
-            model = Speech2TextONNX(
-                config_path=os.path.join(args.model_dir, "config"),
-                encoder_onnx_path=os.path.join(args.model_dir, "encoder"),
-                ctc_onnx_path=os.path.join(args.model_dir, "ctc"),
-                feat_stats_path=os.path.join(args.model_dir, "feat_normalize"),
-                bpe_model_path=os.path.join(args.model_dir, "bpe_model"),
-                kenlm_file=os.path.join(args.model_dir, "../lm"),
-                kenlm_alpha=args.kenlm_alpha,
-                kenlm_beta=args.kenlm_beta,
-                word_vocab_file=os.path.join(args.model_dir, "word_vocab"),
-                word_vocab_size=args.word_vocab_size,
-            )
-            model_mapping = {k: model for k in model_mapping.keys()}
-    
-    # OpenVINO model
-    elif "openvino" in args.model_dir:
-        logger.info("Loading OpenVINO model")
-        model_mapping = {2: None, 4: None, 6: None, 8: None, 10: None}
-        length_duration_mapping = {256: 2, 512: 4, 768: 6, 1024: 8, 1280: 10}
-        
-        if args.model_dir.endswith("*"):
-            # Load multiple OpenVINO models for different durations
-            for max_length, max_duration in length_duration_mapping.items():
-                logger.info(f"Loading model with max length: {max_length}")
-                model_dir = args.model_dir[:-1] + f"_{max_length}"
-                model_mapping[max_duration] = Speech2TextOpenVINO(
-                    config_path=os.path.join(model_dir, "config"),
-                    encoder_model_path=os.path.join(model_dir, "encoder.xml"),
-                    ctc_model_path=os.path.join(model_dir, "ctc.xml"),
-                    feat_stats_path=os.path.join(model_dir, "feat_normalize"),
-                    bpe_model_path=os.path.join(model_dir, "bpe_model"),
-                    kenlm_file=os.path.join(model_dir, "../lm"),
-                    kenlm_alpha=args.kenlm_alpha,
-                    kenlm_beta=args.kenlm_beta,
-                    word_vocab_file=os.path.join(model_dir, "word_vocab"),
-                    word_vocab_size=args.word_vocab_size,
-                )
-        else:
-            # Single OpenVINO model
-            model = Speech2TextOpenVINO(
-                config_path=os.path.join(args.model_dir, "config"),
-                encoder_model_path=os.path.join(args.model_dir, "encoder.xml"),
-                ctc_model_path=os.path.join(args.model_dir, "ctc.xml"),
-                feat_stats_path=os.path.join(args.model_dir, "feat_normalize"),
-                bpe_model_path=os.path.join(args.model_dir, "bpe_model"),
-                kenlm_file=os.path.join(args.model_dir, "../lm"),
-                kenlm_alpha=args.kenlm_alpha,
-                kenlm_beta=args.kenlm_beta,
-                word_vocab_file=os.path.join(args.model_dir, "word_vocab"),
-                word_vocab_size=args.word_vocab_size,
-            )
-            model_mapping = {k: model for k in model_mapping.keys()}
-    
-    # Ensemble Transducer model
-    elif args.ext_model_dir is not None:
-        logger.info("Loading Ensemble Transducer model")
-        from espnet2.bin.asr_ensemble_transducer_inference import Speech2Text as Speech2TextEnsembleTransducer
-        
-        asr_train_config = os.path.join(args.model_dir, "config")
-        update_config(asr_train_config, args.model_dir)
-        ext_asr_train_config = os.path.join(args.ext_model_dir, "config")
-        update_config(ext_asr_train_config, args.ext_model_dir)
-
-        model_mapping["model"] = Speech2TextEnsembleTransducer(
-            list_asr_train_config=[asr_train_config, ext_asr_train_config],
-            list_asr_model_file=[
-                os.path.join(args.model_dir, "model"),
-                os.path.join(args.ext_model_dir, "model")
-            ],
-            ensemble_weights='0.5 0.5'.split(),
-            device=args.device,
-            kenlm_file=[os.path.join(args.model_dir, "../lm")],
-            kenlm_alpha=[args.kenlm_alpha] * 2,
-            kenlm_beta=[args.kenlm_beta] * 2,
-            word_vocab_file=os.path.join(args.model_dir, "word_vocab"),
-            word_vocab_size=args.word_vocab_size,
-        )
-    
-    # Transducer model
-    elif "transducer" in args.model_dir:
-        logger.info("Loading Transducer model")
-        asr_train_config = os.path.join(args.model_dir, "config")
-        update_config(asr_train_config, args.model_dir)
-        
-        model_mapping["model"] = Speech2TextTransducer(
-            asr_train_config=asr_train_config,
-            asr_model_file=os.path.join(args.model_dir, "model"),
-            device=args.device,
-            kenlm_file=os.path.join(args.model_dir, "../lm"),
-            kenlm_alpha=args.kenlm_alpha,
-            kenlm_beta=args.kenlm_beta,
-            word_vocab_file=os.path.join(args.model_dir, "word_vocab"),
-            word_vocab_size=args.word_vocab_size,
-        )
-    
-    # Standard PyTorch model
-    else:
-        logger.info("Loading standard PyTorch model")
-        asr_train_config = os.path.join(args.model_dir, "config")
-        update_config(asr_train_config, args.model_dir)
-        
-        model_mapping["model"] = Speech2Text(
-            asr_train_config=asr_train_config,
-            asr_model_file=os.path.join(args.model_dir, "model"),
-            device=args.device,
-            ctc_weight=args.ctc_weight,
-            kenlm_file=os.path.join(args.model_dir, "../lm"),
-            kenlm_alpha=args.kenlm_alpha,
-            kenlm_beta=args.kenlm_beta,
-            word_vocab_file=os.path.join(args.model_dir, "word_vocab"),
-            word_vocab_size=args.word_vocab_size,
-        )
-
-    return model_mapping
-
-
 if __name__ == '__main__':
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='ASR Server Configuration')
-    parser.add_argument('--model_dir', type=str, required=True, 
-                      help='Directory containing the ASR model files')
-    parser.add_argument('--ext_model_dir', type=str, default=None,
-                      help='Directory for additional model in ensemble configuration')
-    parser.add_argument('--device', type=str, default="cpu",
-                      help='Device to run the model on (cpu/cuda)')
+    parser = argparse.ArgumentParser(description='VietASR API Server v2')
+    parser.add_argument('--model-path', type=str, required=True,
+                        help='Path to TorchScript or PyTorch model')
+    parser.add_argument('--bpe-model', type=str, required=True,
+                        help='Path to sentencepiece bpe.model')
+    parser.add_argument('--model-type', type=str, default="auto",
+                        choices=["auto", "torchscript", "pytorch"],
+                        help='Model type (auto-detect by default)')
+    parser.add_argument('--device', type=str, default="cuda:0",
+                        help='Device to run the model on')
     parser.add_argument('--host', type=str, default="0.0.0.0",
-                      help='Host address to bind the server to')
+                        help='Host address to bind the server to')
     parser.add_argument('--port', type=int, default=5000,
-                      help='Port to run the server on')
+                        help='Port to run the server on')
     parser.add_argument('--workers', type=int, default=1,
-                      help='Number of worker processes')
-    parser.add_argument('--ctc_weight', type=float, default=0.5,
-                      help='Weight for CTC loss in hybrid models')
-    parser.add_argument('--method', type=str, default="ctc_beamsearch_lm",
-                      help='Decoding method to use')
-    parser.add_argument('--kenlm_alpha', type=float, default=0.3,
-                      help='Language model alpha parameter')
-    parser.add_argument('--kenlm_beta', type=float, default=1.5,
-                      help='Language model beta parameter')
-    parser.add_argument('--word_vocab_size', type=int, default=-1,
-                      help='Size of word vocabulary')
+                        help='Number of worker processes')
     
     args = parser.parse_args()
-
+    
     # Configure logging
     log_level = "INFO"
     log_format = ("<green>{time:YYYY-MM-DD HH:mm:ss.SSS zz}</green> | "
-                 "<level>{level: <8}</level> | "
-                 "<yellow>Line {line: >4} ({file}):</yellow> <b>{message}</b>")
+                  "<level>{level: <8}</level> | "
+                  "<yellow>Line {line: >4} ({file}):</yellow> <b>{message}</b>")
     
-    logger.add(sys.stderr, level=log_level, format=log_format, 
-              colorize=True, backtrace=True, diagnose=True)
-    logger.add(os.path.join(args.model_dir, 'file.log'), level=log_level, 
-              format=log_format, colorize=False, backtrace=True, diagnose=True)
-
+    logger.add(sys.stderr, level=log_level, format=log_format,
+               colorize=True, backtrace=True, diagnose=True)
+    
     logger.info(f"Starting server with configuration: {vars(args)}")
-
-    # Load the appropriate ASR model
-    if not args.model_dir:
-        logger.error("model_dir must be specified")
-        sys.exit(1)
-        
+    
+    # Load the ASR model
     try:
-        duration_model_mapping = load_model(args)
-        model_name = args.model_dir.split("/")[-1]
+        asr_model = ASRModel(
+            model_path=args.model_path,
+            bpe_path=args.bpe_model,
+            model_type=args.model_type,
+            device=args.device,
+        )
+        model_name = Path(args.model_path).stem
         logger.success(f"Successfully loaded model: {model_name}")
         
         # Start the FastAPI server

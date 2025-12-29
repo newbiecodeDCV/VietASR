@@ -1331,6 +1331,7 @@ IOSPY|ILSPY
 phôn|phone
 mailation|violation
 down phone|down fall
+a|
 á| 
 à| 
 ạ| 
@@ -1443,3 +1444,5 @@ tap|tab
 khỏe|khoẻ
 thủy|thuỷ
 lờ es|ls
+alo|alô
+a lô|alô
