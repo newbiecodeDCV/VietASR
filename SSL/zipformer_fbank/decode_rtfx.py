@@ -107,6 +107,7 @@ import k2
 import sentencepiece as spm
 import torch
 import torch.nn as nn
+from lhotse import load_manifest_lazy
 from asr_datamodule import FinetuneAsrDataModule
 from beam_search import (
     beam_search,
@@ -1039,6 +1040,20 @@ def main():
     elif args.cuts_name == "dev":
         test_sets.append("dev")
         test_cuts_lis.append(finetune_datamoddule.dev_cuts())
+    else:
+        # Support custom dataset names
+        logging.info(f"Loading custom dataset: {args.cuts_name}")
+        manifest_path = Path(args.manifest_dir) / f"vietASR_cuts_{args.cuts_name}.jsonl.gz"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Could not find manifest file: {manifest_path}\n"
+                f"Expected format: vietASR_cuts_{{cuts_name}}.jsonl.gz\n"
+                f"Available options: 'all', 'test', 'dev', or provide a custom dataset name"
+            )
+        logging.info(f"Loading manifest from: {manifest_path}")
+        cuts = load_manifest_lazy(manifest_path)
+        test_sets.append(args.cuts_name)
+        test_cuts_lis.append(cuts)
 
     test_dl = [
         finetune_datamoddule.test_dataloaders(test_cuts) for test_cuts in test_cuts_lis
