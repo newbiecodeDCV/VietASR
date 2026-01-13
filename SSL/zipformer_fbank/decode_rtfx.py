@@ -108,6 +108,9 @@ import sentencepiece as spm
 import torch
 import torch.nn as nn
 from lhotse import load_manifest_lazy
+
+# Import Vietnamese text normalization module
+from text_normalization import normalize_text, remove_filler_words, FILLER_WORDS
 from asr_datamodule import FinetuneAsrDataModule
 from beam_search import (
     beam_search,
@@ -200,6 +203,14 @@ def get_parser():
         type=str,
         default="zipformer/exp",
         help="The experiment dir",
+    )
+
+    parser.add_argument(
+        "--norm",
+        type=str2bool,
+        default=False,
+        help="Enable extended text normalization for WER calculation. "
+        "When True, applies additional mappings for tech terms and common typos.",
     )
 
     parser.add_argument(
@@ -677,7 +688,6 @@ def decode_dataset(
     start_time = time.time()
     for batch_idx, batch in enumerate(dl):
         texts = batch["supervisions"]["text"]
-        texts = [text.upper() for text in texts]
         cut_ids = [cut.id for cut in batch["cuts"]]
 
         for cut in batch["cuts"]:
@@ -700,8 +710,21 @@ def decode_dataset(
             this_batch = []
             assert len(hyps) == len(texts)
             for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
-                ref_words = ref_text.upper().split()
-                this_batch.append((cut_id, ref_words, hyp_words))
+                # Normalize BOTH ref and hyp for fair comparison
+                # use_extended=params.norm enables additional tech term mappings
+                ref_text_norm = normalize_text(ref_text, use_extended=params.norm)
+                ref_words = ref_text_norm.split()
+                
+                # Normalize hypothesis
+                hyp_text = " ".join(hyp_words)
+                hyp_text_norm = normalize_text(hyp_text, use_extended=params.norm)
+                hyp_words_norm = hyp_text_norm.split()
+
+                # Remove filler words from both ref and hyp for WER calculation
+                ref_words_filtered = remove_filler_words(ref_words)
+                hyp_words_filtered = remove_filler_words(hyp_words_norm)
+
+                this_batch.append((cut_id, ref_words_filtered, hyp_words_filtered))
 
             results[name].extend(this_batch)
 
